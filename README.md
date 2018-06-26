@@ -1,2 +1,2 @@
 # blog_posts
-Hexo Blog Posts Backup
+Hexo Blog 文章和对应图片的备份。
