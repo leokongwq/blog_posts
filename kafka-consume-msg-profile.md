@@ -6,7 +6,7 @@ date: 2017-02-28 23:08:31
 tags:
 - MQ
 - kafka
-- Springboot
+- springboot
 categories:
 - 消息中间件
 ---

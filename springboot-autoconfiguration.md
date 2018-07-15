@@ -1,10 +1,11 @@
 ---
 layout: post
 comments: true
-title: consul之acl配置
+title: SpringBoot自动配置分析
 date: 2017-02-28 23:08:31
 tags:
 - consul
+- springboot
 ---
 
 ## 前言
