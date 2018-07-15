@@ -433,3 +433,8 @@ public final void invoke(Request request, Response response)
 2. 应用开发一定需要遵守API规范，否则会导致奇怪问题的发生．好多人总是说遇到的问题多，踩坑多，那是因为你从来不仔细阅读相关api规范文档或官方文档．不遵守规范导致的问题能叫坑吗？
 3. 在使用任何一项技术时，优先查询官方文档．不要随手google或baidu．　实话说，网上的文章质量参差不齐，难免找到理解错误的文档．
 4. 养成阅读源代码的习惯，好处不言而喻．如果３年前没有读过tomcat6的源代码，今天排查起来问题就非常困难了.
+
+## 参考资料
+
+[https://zh.wikipedia.org/wiki/HTTP_302](https://zh.wikipedia.org/wiki/HTTP_302)
+[https://tools.ietf.org/html/rfc2616#section-10.3.3](https://tools.ietf.org/html/rfc2616#section-10.3.3)

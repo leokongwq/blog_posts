@@ -25,6 +25,8 @@ tags:
 
 > 注意：该配置项只有在配置了`acl_datacenter`后才起作用
 
+<!-- more -->
+
 ### acl_down_policy
 
 该配置项可选的值为`allow`，`deny`或`extend-cache`，　默认值是`extend-cache`。假如不能从`acl_datacenter`或`Leader`节点获取一个token的acl信息，则该配置项指定的策略被使用。
