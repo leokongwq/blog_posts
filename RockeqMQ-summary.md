@@ -95,6 +95,524 @@ config 目录保存的是一些配置信息
 
 该文件保存Topic信息
 
+#### abort文件
+
+abort 文件是在`DefaultMessageStore`启动时创建在，在正常关机的情况下会删除。
+
+```java
+private void createTempFile() throws IOException {
+    String fileName = StorePathConfigHelper.getAbortFile(this.messageStoreConfig.getStorePathRootDir());
+    File file = new File(fileName);
+    MappedFile.ensureDirOK(file.getParent());
+    boolean result = file.createNewFile();
+    log.info(fileName + (result ? " create OK" : " already exists"));
+}
+```
+
+#### checkpoint 文件
+
+文件内容：
+
+```java
+public StoreCheckpoint(final String scpPath) throws IOException {
+    File file = new File(scpPath);
+    MappedFile.ensureDirOK(file.getParent());
+    boolean fileExists = file.exists();
+
+    this.randomAccessFile = new RandomAccessFile(file, "rw");
+    this.fileChannel = this.randomAccessFile.getChannel();
+    this.mappedByteBuffer = fileChannel.map(MapMode.READ_WRITE, 0, MappedFile.OS_PAGE_SIZE);
+
+    if (fileExists) {
+        log.info("store checkpoint file exists, " + scpPath);
+        this.physicMsgTimestamp = this.mappedByteBuffer.getLong(0);
+        this.logicsMsgTimestamp = this.mappedByteBuffer.getLong(8);
+        this.indexMsgTimestamp = this.mappedByteBuffer.getLong(16);
+    } else {
+        log.info("store checkpoint file not exists, " + scpPath);
+    }
+}
+```
+
+
+
+### MappedFile & MappedFileQueue & AllocateMappedFileService
+
+#### MappedFile 
+
+MappedFile ：顾名思义就是一个内存映射文件。内存映射文件写入时，首先写入`OS Page Cache`中，OS会定期刷新文件内容到磁盘上。也可以通过如下的方法强制写入磁盘：
+
+1. FileChannel.force
+2. MappedByteBuffer.force
+
+MappedFile 是最底层，真正用来保存消息的，主要的保存消息方法如下：
+
+```java
+public AppendMessageResult appendMessage(final MessageExtBrokerInner msg, final AppendMessageCallback cb) {
+    return appendMessagesInner(msg, cb);
+}
+
+public AppendMessageResult appendMessages(final MessageExtBatch messageExtBatch, final AppendMessageCallback cb) {
+    return appendMessagesInner(messageExtBatch, cb);
+}
+/**
+* Broker 写入消息时调用的方法
+*/
+public AppendMessageResult appendMessagesInner(final MessageExt messageExt, final AppendMessageCallback cb) {
+    assert messageExt != null;
+    assert cb != null;
+	// 当前写入MappedFile文件的位置
+    int currentPos = this.wrotePosition.get();
+
+    if (currentPos < this.fileSize) {
+        // writeBuffer 本身也是一个DirectBuffer, 默认大小1G 和 MappedFile大小相同
+        // 每次slice 都会得到position == 0, limit 和 capacity 等于1G 的影子ByteBuffer
+        ByteBuffer byteBuffer = writeBuffer != null ? writeBuffer.slice() : this.mappedByteBuffer.slice();
+        // 通过设置position， 使得上面获取的影子ByteBuffer写入时不会覆盖原有数据
+        // 只能从底层真实的ByteBuffer的position处开始写数据
+        // 因为 writeBuffer 和 mappedByteBuffer 的position一直保持不变
+        // 所以设置position的方法不会抛出异常
+        byteBuffer.position(currentPos);
+        AppendMessageResult result = null;
+        if (messageExt instanceof MessageExtBrokerInner) {
+            result = cb.doAppend(this.getFileFromOffset(), byteBuffer, this.fileSize - currentPos, (MessageExtBrokerInner) messageExt);
+        } else if (messageExt instanceof MessageExtBatch) {
+            result = cb.doAppend(this.getFileFromOffset(), byteBuffer, this.fileSize - currentPos, (MessageExtBatch) messageExt);
+        } else {
+            return new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+        }
+        this.wrotePosition.addAndGet(result.getWroteBytes());
+        this.storeTimestamp = result.getStoreTimestamp();
+        return result;
+    }
+    log.error("MappedFile.appendMessage return null, wrotePosition: {} fileSize: {}", currentPos, this.fileSize);
+    return new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+}
+
+public boolean appendMessage(final byte[] data) {
+    int currentPos = this.wrotePosition.get();
+
+    if ((currentPos + data.length) <= this.fileSize) {
+        try {
+            this.fileChannel.position(currentPos);
+            this.fileChannel.write(ByteBuffer.wrap(data));
+        } catch (Throwable e) {
+            log.error("Error occurred when append message to mappedFile.", e);
+        }
+        this.wrotePosition.addAndGet(data.length);
+        return true;
+    }
+
+    return false;
+}
+
+private boolean isAbleToFlush(final int flushLeastPages) {
+    //上次刷盘的位置
+    int flush = this.flushedPosition.get();
+    // 当前的写入位置
+    int write = getReadPosition();
+	//如果文件写满了，那么需要刷盘
+    if (this.isFull()) {
+        return true;
+    }
+	//计算是否满足最少刷盘页数的的要求
+    if (flushLeastPages > 0) {
+        // 不可以用(write - flush) / OS_PAGE_SIZE 吗？
+        // OS_PAGE_SIZE 写死为 4k, 如果启用大页， 吞吐量不是更高吗？
+        return ((write / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE)) >= flushLeastPages;
+    }
+	// 只要上次刷盘后有新的数据写入，就可以刷盘
+    return write > flush;
+}
+
+/**
+ * @return The current flushed position
+*/
+public int flush(final int flushLeastPages) {
+    if (this.isAbleToFlush(flushLeastPages)) {
+        if (this.hold()) {
+            int value = getReadPosition();
+
+            try {
+                //We only append data to fileChannel or mappedByteBuffer, never both.
+                if (writeBuffer != null || this.fileChannel.position() != 0) {
+                    this.fileChannel.force(false);
+                } else {
+                    this.mappedByteBuffer.force();
+                }
+            } catch (Throwable e) {
+                log.error("Error occurred when force data to disk.", e);
+            }
+
+            this.flushedPosition.set(value);
+            this.release();
+        } else {
+            log.warn("in flush, hold failed, flush offset = " + this.flushedPosition.get());
+            // 如果 使用了writeBuffer, getReadPosition返回的是当前写入的position
+            // 写入的position 是大于等于 刷盘的位置的，没有刷盘就更新flushedPosition合适吗？
+            this.flushedPosition.set(getReadPosition());
+        }
+    }
+    return this.getFlushedPosition();
+}
+
+protected boolean isAbleToCommit(final int commitLeastPages) {
+    int flush = this.committedPosition.get();
+    int write = this.wrotePosition.get();
+
+    if (this.isFull()) {
+        return true;
+    }
+
+    if (commitLeastPages > 0) {
+        return ((write / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE)) >= commitLeastPages;
+    }
+
+    return write > flush;
+}
+
+public int commit(final int commitLeastPages) {
+    // writeBuffer 为 NULL 表示消息是直接写入MappedByteBuffer的
+    if (writeBuffer == null) {
+        //no need to commit data to file channel, so just regard wrotePosition as committedPosition.
+        return this.wrotePosition.get();
+    }
+    if (this.isAbleToCommit(commitLeastPages)) {
+        if (this.hold()) {
+            commit0(commitLeastPages);
+            this.release();
+        } else {
+            log.warn("in commit, hold failed, commit offset = " + this.committedPosition.get());
+        }
+    }
+
+    // All dirty data has been committed to FileChannel.
+    if (writeBuffer != null && this.transientStorePool != null && this.fileSize == this.committedPosition.get()) {
+        this.transientStorePool.returnBuffer(writeBuffer);
+        this.writeBuffer = null;
+    }
+
+    return this.committedPosition.get();
+}
+```
+
+
+
+#### MappedFileQueue 
+
+MappedFileQueue  就是由多个`MappedFile`组成的一个队列。由它来管理多个分配的内存映射文件。多个文件组成一个逻辑上的单一文件，供上层的业务使用。
+
+```java
+public class MappedFileQueue {
+    // 保存所有分配的MappedFile
+	private final CopyOnWriteArrayList<MappedFile> mappedFiles = new CopyOnWriteArrayList<MappedFile>();
+    
+    // 保存刷盘位置, 该字段的值是在Broker启动时，恢复状态时计算出来的。
+    // 正常情况下，是CommmitLog在磁盘上最后一个MappedFile中最后一个正常消息的偏移量
+    private long flushedWhere = 0;
+    // 写入到PageCache的位置， 在Broker启动时，值和flushedWhere计算逻辑一致。
+    private long committedWhere = 0;
+    
+    // 执行刷盘操作，由刷盘后台线程调用
+	public boolean flush(final int flushLeastPages) {
+        boolean result = true;
+        MappedFile mappedFile = this.findMappedFileByOffset(this.flushedWhere, this.flushedWhere == 0);
+        if (mappedFile != null) {
+            long tmpTimeStamp = mappedFile.getStoreTimestamp();
+            // 最底层的刷盘操作，返回MappedFile中已经落盘的数据量
+            int offset = mappedFile.flush(flushLeastPages);
+            // 计算并更新下次刷盘的位置
+            long where = mappedFile.getFileFromOffset() + offset;
+            result = where == this.flushedWhere;
+            this.flushedWhere = where;
+            if (0 == flushLeastPages) {
+                this.storeTimestamp = tmpTimeStamp;
+            }
+        }
+
+        return result;
+    }
+}    
+```
+
+
+
+#### AllocateMappedFileService
+
+MappedFile 的创建有2种方式：
+
+1. 通过MappedFile的构造方法进行创建。
+2. 通过AllocateMappedFileService进行异步创建。(内部有一个创建的`MappedFile`的请求队列，由独立的线程进行`MappedFile`创建)
+
+`MappedFileQueue` 在进行消息保存，需要创建新的`MappedFile`时，内部是通过 `DefaultMessageStore`创建时创建的`AllocateMappedFileService`进行`MappedFile`创建的。
+
+AllocateMappedFileService 会使用`MappedFile`如下的构造方法进行创建：
+
+```java
+public MappedFile(final String fileName, final int fileSize,
+                  final TransientStorePool transientStorePool) throws IOException {
+    init(fileName, fileSize, transientStorePool);
+}
+public void init(final String fileName, final int fileSize,
+                 final TransientStorePool transientStorePool) throws IOException {
+    init(fileName, fileSize);
+    // 消息会先写入ByteBuffer中，然后再写入FileChannel
+    // writeBuffer 大小默认是1G, 和 MappedFile的文件大小相同
+    this.writeBuffer = transientStorePool.borrowBuffer();
+    this.transientStorePool = transientStorePool;
+}
+```
+
+### DefaultMessageStore 启动流程
+
+#### DefaultMessageStore 初始化
+
+初始化过程最重要的是加载消息文件
+
+```java
+public boolean load() {
+    boolean result = true;
+
+    try {
+        // 判断是否上次是否是正常退出。 正常退出是没有abort文件的
+        boolean lastExitOK = !this.isTempFileExist();
+        log.info("last shutdown {}", lastExitOK ? "normally" : "abnormally");
+	    // 先加载延迟消息		
+        if (null != scheduleMessageService) {
+            result = result && this.scheduleMessageService.load();
+        }
+
+        // load Commit Log
+        // 加载 Commit Log 文件，其实是通过 MappedFileQueue加载每一个MappedFile
+        result = result && this.commitLog.load();
+
+        // load Consume Queue
+        // 实现机制和 Commit Log 一样
+        result = result && this.loadConsumeQueue();
+
+        if (result) {
+            // 初始化checkpoint
+            this.storeCheckpoint =
+                new StoreCheckpoint(StorePathConfigHelper.getStoreCheckpoint(this.messageStoreConfig.getStorePathRootDir()));
+			// 加载索引文件
+            this.indexService.load(lastExitOK);
+			// 进行状态恢复， 底层还是通过
+            this.recover(lastExitOK);
+
+            log.info("load over, and the max phy offset = {}", this.getMaxPhyOffset());
+        }
+    } catch (Exception e) {
+        log.error("load exception", e);
+        result = false;
+    }
+
+    if (!result) {
+        this.allocateMappedFileService.shutdown();
+    }
+
+    return result;
+}
+
+private void recover(final boolean lastExitOK) {
+    // 恢复消费队列状态
+    this.recoverConsumeQueue();
+	// 恢复Commit Log 状态
+    if (lastExitOK) {
+        this.commitLog.recoverNormally();
+    } else {
+        this.commitLog.recoverAbnormally();
+    }
+
+    this.recoverTopicQueueTable();
+}
+```
+
+
+
+#### DefaultMessageStore 启动
+
+### CommitLog 启动流程
+
+#### CommitLog 加载
+
+```java
+public boolean load() {
+    boolean result = this.mappedFileQueue.load();
+    log.info("load commit log " + (result ? "OK" : "Failed"));
+    return result;
+}
+```
+
+加载的过程就是对构成的Commit Log的所有磁盘文件，创建对应的MappedFile，并通过MappedFileQueue进行组织的过程。再次过程，申请了虚拟内存空间，但是并没有读取磁盘文件。
+
+#### CommitLog 启动
+
+```java
+public void start() {
+    // 启动消息 刷盘后台服务线程
+    this.flushCommitLogService.start();
+	// 如果启用了异步刷盘，则启动 消息commit后台服务线程
+    if (defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+        this.commitLogService.start();
+    }
+}
+```
+
+#### CommitLog  恢复
+
+恢复分为正常恢复和异常恢复
+
+##### 正常恢复
+
+```java
+public void recoverNormally() {
+    // 是否校验数据完成性，这个会导致启动变慢
+    boolean checkCRCOnRecover = this.defaultMessageStore.getMessageStoreConfig().isCheckCRCOnRecover();
+    final List<MappedFile> mappedFiles = this.mappedFileQueue.getMappedFiles();
+    if (!mappedFiles.isEmpty()) {
+        // 从最后三个文件进行恢复
+        int index = mappedFiles.size() - 3;
+        if (index < 0)
+            index = 0;
+		
+        MappedFile mappedFile = mappedFiles.get(index);
+        ByteBuffer byteBuffer = mappedFile.sliceByteBuffer();
+        //本文件的起始偏移量，也就是文件名称
+        long processOffset = mappedFile.getFileFromOffset();
+        // 从0开始校验消息文件
+        long mappedFileOffset = 0;
+        while (true) {
+            DispatchRequest dispatchRequest = this.checkMessageAndReturnSize(byteBuffer, checkCRCOnRecover);
+            int size = dispatchRequest.getMsgSize();
+            // Normal data
+            if (dispatchRequest.isSuccess() && size > 0) {
+                mappedFileOffset += size;
+            }
+            // Come the end of the file, switch to the next file Since the
+            // return 0 representatives met last hole,
+            // this can not be included in truncate offset
+            else if (dispatchRequest.isSuccess() && size == 0) {
+                // 所有文件都验证完成
+                index++;
+                if (index >= mappedFiles.size()) {
+                    // Current branch can not happen
+                    log.info("recover last 3 physics file over, last mapped file " + mappedFile.getFileName());
+                    break;
+                } else {
+                    // 切换下一个文件进行校验
+                    mappedFile = mappedFiles.get(index);
+                    byteBuffer = mappedFile.sliceByteBuffer();
+                    processOffset = mappedFile.getFileFromOffset();
+                    mappedFileOffset = 0;
+                    log.info("recover next physics file, " + mappedFile.getFileName());
+                }
+            }
+            // Intermediate file read error
+            else if (!dispatchRequest.isSuccess()) {
+                log.info("recover physics file end, " + mappedFile.getFileName());
+                break;
+            }
+        }
+		// processOffset 就是有效消息的位置
+        processOffset += mappedFileOffset;
+        this.mappedFileQueue.setFlushedWhere(processOffset);
+        this.mappedFileQueue.setCommittedWhere(processOffset);
+        // 丢弃broken的消息
+        this.mappedFileQueue.truncateDirtyFiles(processOffset);
+    }
+}
+```
+
+##### 异常恢复
+
+```java
+public void recoverAbnormally() {
+    // recover by the minimum time stamp
+    boolean checkCRCOnRecover = this.defaultMessageStore.getMessageStoreConfig().isCheckCRCOnRecover();
+    final List<MappedFile> mappedFiles = this.mappedFileQueue.getMappedFiles();
+    if (!mappedFiles.isEmpty()) {
+        // 从倒数第一个开始恢复， 在load的时候，按文件名称排序的
+        int index = mappedFiles.size() - 1;
+        MappedFile mappedFile = null;
+        for (; index >= 0; index--) {
+            mappedFile = mappedFiles.get(index);
+            //查找第一个需要需要恢复的文件
+            if (this.isMappedFileMatchedRecover(mappedFile)) {
+                log.info("recover from this mapped file " + mappedFile.getFileName());
+                break;
+            }
+        }
+		// 没有满足恢复查找条件的问题件，那么从第一个文件开始恢复
+        if (index < 0) {
+            index = 0;
+            mappedFile = mappedFiles.get(index);
+        }
+
+        ByteBuffer byteBuffer = mappedFile.sliceByteBuffer();
+        long processOffset = mappedFile.getFileFromOffset();
+        long mappedFileOffset = 0;
+        while (true) {
+            DispatchRequest dispatchRequest = this.checkMessageAndReturnSize(byteBuffer, checkCRCOnRecover);
+            int size = dispatchRequest.getMsgSize();
+
+            // Normal data
+            if (size > 0) {
+                mappedFileOffset += size;
+				// 是否允许重复消息
+                if (this.defaultMessageStore.getMessageStoreConfig().isDuplicationEnable()) {
+                    // getCommitLogOffset 返回的是 消息在Commit Log中的偏移量
+                    if (dispatchRequest.getCommitLogOffset() < this.defaultMessageStore.getConfirmOffset()) {
+                        this.defaultMessageStore.doDispatch(dispatchRequest);
+                    }
+                } else {
+                    // 构建索引 和 消费队列
+                    this.defaultMessageStore.doDispatch(dispatchRequest);
+                }
+            }
+            // Intermediate file read error
+            else if (size == -1) {
+                log.info("recover physics file end, " + mappedFile.getFileName());
+                break;
+            }
+            // Come the end of the file, switch to the next file
+            // Since the return 0 representatives met last hole, this can
+            // not be included in truncate offset
+            else if (size == 0) {  // 文件末尾
+                index++;
+                if (index >= mappedFiles.size()) { // 最后一个文件
+                    // The current branch under normal circumstances should
+                    // not happen
+                    log.info("recover physics file over, last mapped file " + mappedFile.getFileName());
+                    break; 
+                } else { // 切换下一个文件进行恢复
+                    mappedFile = mappedFiles.get(index);
+                    byteBuffer = mappedFile.sliceByteBuffer();
+                    processOffset = mappedFile.getFileFromOffset();
+                    mappedFileOffset = 0;
+                    log.info("recover next physics file, " + mappedFile.getFileName());
+                }
+            }
+        }
+		// 设置初始状态
+        processOffset += mappedFileOffset;
+        this.mappedFileQueue.setFlushedWhere(processOffset);
+        this.mappedFileQueue.setCommittedWhere(processOffset);
+        this.mappedFileQueue.truncateDirtyFiles(processOffset);
+
+        // Clear ConsumeQueue redundant data
+        this.defaultMessageStore.truncateDirtyLogicFiles(processOffset);
+    }
+    // Commitlog case files are deleted
+    else {
+        this.mappedFileQueue.setFlushedWhere(0);
+        this.mappedFileQueue.setCommittedWhere(0);
+        this.defaultMessageStore.destroyLogics();
+    }
+}
+```
+
+
+
 ### Broker消息保存流程
 
 #### 1. Rpc请求处理
@@ -497,13 +1015,16 @@ public PutMessageResult putMessage(final MessageExtBrokerInner msg) {
     // Statistics
     storeStatsService.getSinglePutMessageTopicTimesTotal(msg.getTopic()).incrementAndGet();
     storeStatsService.getSinglePutMessageTopicSizeTotal(topic).addAndGet(result.getWroteBytes());
-
+	// 通知刷盘线程进行刷盘操作
     handleDiskFlush(result, putMessageResult, msg);
+    // 主从复制处理
     handleHA(result, putMessageResult, msg);
 
     return putMessageResult;
 }
 ```
+
+
 
 ##### MappedFileQueue.getLastMappedFile()
 
@@ -585,6 +1106,437 @@ public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) 
 }
 ```
 
+### CommitLog Flush 流程
+
+消息刷盘的过程是由 `FlushCommitLogService`的3GroupCommitService个子类完成的。
+
+```java
+if (FlushDiskType.SYNC_FLUSH == defaultMessageStore.getMessageStoreConfig().getFlushDiskType()) {
+    this.flushCommitLogService = new GroupCommitService();
+} else {
+    this.flushCommitLogService = new FlushRealTimeService();
+}
+
+this.commitLogService = new CommitRealTimeService();
+```
+
+
+
+#### CommitRealTimeService
+
+CommitRealTimeService 该后台服务线程起作用的前提是`MappedFile`写入数据时使用了`WriteBuffer`，
+
+也就是配置项`transientStorePoolEnable` 的值为true，并且刷盘模式是`ASYNC_FLUSH`， 而且是Master。
+
+作用是：消息先写入DirectByteBuffer中，然后通过该后台服务线程写入到FileChannel （）。
+
+```java
+class CommitRealTimeService extends FlushCommitLogService {
+
+    private long lastCommitTimestamp = 0;
+
+    @Override
+    public String getServiceName() {
+        return CommitRealTimeService.class.getSimpleName();
+    }
+
+    @Override
+    public void run() {
+        CommitLog.log.info(this.getServiceName() + " service started");
+        while (!this.isStopped()) {
+            // 默认值200ms, 只有在启用了 TransientStorePool 的时候使用
+            // 刷新数据到FileChannel
+            int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitIntervalCommitLog();
+			// 默认的页数 4页
+            int commitDataLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogLeastPages();
+			// 默认值 200ms
+            int commitDataThoroughInterval =
+                CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogThoroughInterval();
+
+            long begin = System.currentTimeMillis();
+            if (begin >= (this.lastCommitTimestamp + commitDataThoroughInterval)) {
+                this.lastCommitTimestamp = begin;
+                commitDataLeastPages = 0;
+            }
+
+            try {
+                boolean result = CommitLog.this.mappedFileQueue.commit(commitDataLeastPages);
+                long end = System.currentTimeMillis();
+                if (!result) {
+                    this.lastCommitTimestamp = end; // result = false means some data committed.
+                    //now wake up flush thread.
+                    flushCommitLogService.wakeup();
+                }
+
+                if (end - begin > 500) {
+                    log.info("Commit data to file costs {} ms", end - begin);
+                }
+                this.waitForRunning(interval);
+            } catch (Throwable e) {
+                CommitLog.log.error(this.getServiceName() + " service has exception. ", e);
+            }
+        }
+
+        boolean result = false;
+        for (int i = 0; i < RETRY_TIMES_OVER && !result; i++) {
+            result = CommitLog.this.mappedFileQueue.commit(0);
+            CommitLog.log.info(this.getServiceName() + " service shutdown, retry " + (i + 1) + " times " + (result ? "OK" : "Not OK"));
+        }
+        CommitLog.log.info(this.getServiceName() + " service end");
+    }
+}
+```
+
+
+
+#### GroupCommitService
+
+如果配置了同步刷盘模式，则使用`GroupCommitService`
+
+```java
+class GroupCommitService extends FlushCommitLogService {
+    private volatile List<GroupCommitRequest> requestsWrite = new ArrayList<GroupCommitRequest>();
+    private volatile List<GroupCommitRequest> requestsRead = new ArrayList<GroupCommitRequest>();
+	
+    // 提交同步刷盘请求
+    public synchronized void putRequest(final GroupCommitRequest request) {
+        synchronized (this.requestsWrite) {
+            this.requestsWrite.add(request);
+        }
+        if (hasNotified.compareAndSet(false, true)) {
+            waitPoint.countDown(); // notify
+        }
+    }
+
+    private void swapRequests() {
+        List<GroupCommitRequest> tmp = this.requestsWrite;
+        this.requestsWrite = this.requestsRead;
+        this.requestsRead = tmp;
+    }
+
+    private void doCommit() {
+        synchronized (this.requestsRead) {
+            if (!this.requestsRead.isEmpty()) {
+                for (GroupCommitRequest req : this.requestsRead) {
+                    // There may be a message in the next file, so a maximum of
+                    // two times the flush
+                    boolean flushOK = false;
+                    for (int i = 0; i < 2 && !flushOK; i++) {
+                        // 判断是否已经刷盘了
+                        flushOK = CommitLog.this.mappedFileQueue.getFlushedWhere() >= req.getNextOffset();
+                        if (!flushOK) {
+                            // 刷盘页数为0表示直接调用force方法
+                            // 不再判断commited 和 write直接的差值
+                            CommitLog.this.mappedFileQueue.flush(0);
+                        }
+                    }
+					// 唤醒等待的消息写入线程
+                    req.wakeupCustomer(flushOK);
+                }
+
+                long storeTimestamp = CommitLog.this.mappedFileQueue.getStoreTimestamp();
+                if (storeTimestamp > 0) {
+                    CommitLog.this.defaultMessageStore.getStoreCheckpoint().setPhysicMsgTimestamp(storeTimestamp);
+                }
+
+                this.requestsRead.clear();
+            } else {
+                // Because of individual messages is set to not sync flush, it
+                // will come to this process
+                CommitLog.this.mappedFileQueue.flush(0);
+            }
+        }
+    }
+
+    public void run() {
+        CommitLog.log.info(this.getServiceName() + " service started");
+
+        while (!this.isStopped()) {
+            try {
+                // 没有被通知刷盘，则等待10ms
+                this.waitForRunning(10);
+                // 执行刷盘操作
+                this.doCommit();
+            } catch (Exception e) {
+                CommitLog.log.warn(this.getServiceName() + " service has exception. ", e);
+            }
+        }
+		// 优雅停机时，执行下面的操作
+        // Under normal circumstances shutdown, wait for the arrival of the
+        // request, and then flush
+        try {
+            Thread.sleep(10);
+        } catch (InterruptedException e) {
+            CommitLog.log.warn("GroupCommitService Exception, ", e);
+        }
+
+        synchronized (this) {
+            this.swapRequests();
+        }
+
+        this.doCommit();
+
+        CommitLog.log.info(this.getServiceName() + " service end");
+    }
+
+    @Override
+    protected void onWaitEnd() {
+        this.swapRequests();
+    }
+
+    @Override
+    public String getServiceName() {
+        return GroupCommitService.class.getSimpleName();
+    }
+
+    @Override
+    public long getJointime() {
+        return 1000 * 60 * 5;
+    }
+}
+```
+
+
+
+#### FlushRealTimeService
+
+如果配置了异步刷盘模式，则使用`FlushRealTimeService`。
+
+```java
+class FlushRealTimeService extends FlushCommitLogService {
+    private long lastFlushTimestamp = 0;
+    private long printTimes = 0;
+
+    public void run() {
+        CommitLog.log.info(this.getServiceName() + " service started");
+
+        while (!this.isStopped()) {
+            //是否定时进行CommitLog的刷盘操作, 默认是False (也就是说默认同步刷盘)
+            boolean flushCommitLogTimed = CommitLog.this.defaultMessageStore.getMessageStoreConfig().isFlushCommitLogTimed();
+			// 刷盘的时间间隔， 默认是 500 毫秒
+            int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushIntervalCommitLog();
+            // 每次刷盘至少需要刷盘的页数，默认是4
+            int flushPhysicQueueLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushCommitLogLeastPages();
+			// 默认是 10 * 1000
+            int flushPhysicQueueThoroughInterval =
+ CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushCommitLogThoroughInterval();
+
+            boolean printFlushProgress = false;
+
+            // Print flush progress
+            long currentTimeMillis = System.currentTimeMillis();
+            if (currentTimeMillis >= (this.lastFlushTimestamp + flushPhysicQueueThoroughInterval)) {
+                this.lastFlushTimestamp = currentTimeMillis;
+                flushPhysicQueueLeastPages = 0;
+                printFlushProgress = (printTimes++ % 10) == 0;
+            }
+
+            try {
+                // 如果是异步刷盘，则休眠 500 毫秒后进行刷盘操作
+                if (flushCommitLogTimed) {
+                    Thread.sleep(interval);
+                } else {
+                    // 同步刷盘，则等待通知
+                    // CommitLog 完成消息写入后，通过方法handleDiskFlush来唤醒刷盘线程
+                    this.waitForRunning(interval);
+                }
+				// 输出刷盘信息， 源码输出日志被注释
+                if (printFlushProgress) {
+                    this.printFlushProgress();
+                }
+
+                long begin = System.currentTimeMillis();
+                // 真正执行刷盘
+                CommitLog.this.mappedFileQueue.flush(flushPhysicQueueLeastPages);
+                long storeTimestamp = CommitLog.this.mappedFileQueue.getStoreTimestamp();
+                if (storeTimestamp > 0) {
+                    CommitLog.this.defaultMessageStore.getStoreCheckpoint().setPhysicMsgTimestamp(storeTimestamp);
+                }
+                long past = System.currentTimeMillis() - begin;
+                if (past > 500) {
+                    log.info("Flush data to disk costs {} ms", past);
+                }
+            } catch (Throwable e) {
+                CommitLog.log.warn(this.getServiceName() + " service has exception. ", e);
+                this.printFlushProgress();
+            }
+        }
+
+        // Normal shutdown, to ensure that all the flush before exit
+        boolean result = false;
+        for (int i = 0; i < RETRY_TIMES_OVER && !result; i++) {
+            result = CommitLog.this.mappedFileQueue.flush(0);
+            CommitLog.log.info(this.getServiceName() + " service shutdown, retry " + (i + 1) + " times " + (result ? "OK" : "Not OK"));
+        }
+
+        this.printFlushProgress();
+
+        CommitLog.log.info(this.getServiceName() + " service end");
+    }
+
+    @Override
+    public String getServiceName() {
+        return FlushRealTimeService.class.getSimpleName();
+    }
+
+    private void printFlushProgress() {
+        // CommitLog.log.info("how much disk fall behind memory, "
+        // + CommitLog.this.mappedFileQueue.howMuchFallBehind());
+    }
+
+    @Override
+    public long getJointime() {
+        return 1000 * 60 * 5;
+    }
+}
+```
+
+
+
+### 队列索引构建流程
+
+所有消息都是先写入CommitLog文件中(不同的Topic消息也是在一个文件中)，然后异步构建消息队列 和 消息索引。
+
+#### ReputMessageService
+
+该类是一个后台服务线程。它在Broker启动时，从CommitLog文件指定的offset处开始读取消息，然后通过`CommitLogDispatcher`进行消息分发。
+
+> 注意：Broker启动时应该从哪个位置读取消息进行分发是非常重要的。通常有2个选择：
+>
+> 1. 从CommitLog文件最大的可读数据点开始分发（可以是最后写入消息的位置 或 已经commit的消息位置）。
+> 2. 从CommitLog确认点开放分发。（如果开启了 duplicationEnable = true 配置项）
+
+
+
+DefaultMessageStore 在启动时的代码，计算reput的位置。
+
+```java
+if (this.getMessageStoreConfig().isDuplicationEnable()) {
+    this.reputMessageService.setReputFromOffset(this.commitLog.getConfirmOffset());
+} else {
+    this.reputMessageService.setReputFromOffset(this.commitLog.getMaxOffset());
+}
+```
+
+
+
+
+
+```java
+// 只要reput的位置后有新写入的消息，则可以构建消费队里和消息索引
+private boolean isCommitLogAvailable() {
+	return this.reputFromOffset < DefaultMessageStore.this.commitLog.getMaxOffset();
+}
+
+private void doReput() {
+    for (boolean doNext = true; this.isCommitLogAvailable() && doNext; ) {
+		// 
+        if (DefaultMessageStore.this.getMessageStoreConfig().isDuplicationEnable()
+            && this.reputFromOffset >= DefaultMessageStore.this.getConfirmOffset()) {
+            break;
+        }
+
+        SelectMappedBufferResult result = DefaultMessageStore.this.commitLog.getData(reputFromOffset);
+        if (result != null) {
+            try {
+                this.reputFromOffset = result.getStartOffset();
+
+                for (int readSize = 0; readSize < result.getSize() && doNext; ) {
+                    DispatchRequest dispatchRequest =
+                        DefaultMessageStore.this.commitLog.checkMessageAndReturnSize(result.getByteBuffer(), false, false);
+                    int size = dispatchRequest.getMsgSize();
+
+                    if (dispatchRequest.isSuccess()) {
+                        if (size > 0) {
+                            DefaultMessageStore.this.doDispatch(dispatchRequest);
+
+                            if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole()
+                                && DefaultMessageStore.this.brokerConfig.isLongPollingEnable()) {
+                                DefaultMessageStore.this.messageArrivingListener.arriving(dispatchRequest.getTopic(),
+                                                                                          dispatchRequest.getQueueId(), dispatchRequest.getConsumeQueueOffset() + 1,
+                                                                                          dispatchRequest.getTagsCode(), dispatchRequest.getStoreTimestamp(),
+                                                                                          dispatchRequest.getBitMap(), dispatchRequest.getPropertiesMap());
+                            }
+
+                            this.reputFromOffset += size;
+                            readSize += size;
+                            if (DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole() == BrokerRole.SLAVE) {
+                                DefaultMessageStore.this.storeStatsService
+                                    .getSinglePutMessageTopicTimesTotal(dispatchRequest.getTopic()).incrementAndGet();
+                                DefaultMessageStore.this.storeStatsService
+                                    .getSinglePutMessageTopicSizeTotal(dispatchRequest.getTopic())
+                                    .addAndGet(dispatchRequest.getMsgSize());
+                            }
+                        } else if (size == 0) {
+                            this.reputFromOffset = DefaultMessageStore.this.commitLog.rollNextFile(this.reputFromOffset);
+                            readSize = result.getSize();
+                        }
+                    } else if (!dispatchRequest.isSuccess()) {
+
+                        if (size > 0) {
+                            log.error("[BUG]read total count not equals msg total size. reputFromOffset={}", reputFromOffset);
+                            this.reputFromOffset += size;
+                        } else {
+                            doNext = false;
+                            if (DefaultMessageStore.this.brokerConfig.getBrokerId() == MixAll.MASTER_ID) {
+                                log.error("[BUG]the master dispatch message to consume queue error, COMMITLOG OFFSET: {}",
+                                          this.reputFromOffset);
+
+                                this.reputFromOffset += result.getSize() - readSize;
+                            }
+                        }
+                    }
+                }
+            } finally {
+                result.release();
+            }
+        } else {
+            doNext = false;
+        }
+    }
+}
+```
+
+
+
+
+
+CommitLogDispatcherBuildConsumeQueue 此类用来构建队列。
+
+```java
+class CommitLogDispatcherBuildConsumeQueue implements CommitLogDispatcher {
+
+    @Override
+    public void dispatch(DispatchRequest request) {
+        final int tranType = MessageSysFlag.getTransactionValue(request.getSysFlag());
+        switch (tranType) {
+            case MessageSysFlag.TRANSACTION_NOT_TYPE:
+            case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+                // 从方法名称能看出，是保存消息位置信息
+                // 队列中保存的是消息的offset，size, tag
+                DefaultMessageStore.this.putMessagePositionInfo(request);
+                break;
+            case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+            case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                break;
+        }
+    }
+}
+```
+
+CommitLogDispatcherBuildIndex 此类用来构建消息索引。
+
+```java
+class CommitLogDispatcherBuildIndex implements CommitLogDispatcher {
+     @Override
+     public void dispatch(DispatchRequest request) {
+         if (DefaultMessageStore.this.messageStoreConfig.isMessageIndexEnable()) {
+             DefaultMessageStore.this.indexService.buildIndex(request);
+         }
+     }
+}
+```
+
 
 
 ## 延迟消息实现
@@ -653,8 +1605,122 @@ ConsumeQueue中每个消息时20Byte长。结构为
 
 ![img](https://upload-images.jianshu.io/upload_images/5149787-be103f4e0b434fe5.png?imageMogr2/auto-orient/strip|imageView2/2/w/1200/format/webp)
 
+## 相关知识总结
+
+### JVM shutdownhook
+
+JVM 在在shutdown时， 会响应如下两种事件：
+
+1. 进程正常退出（最后一个非Daemon线程退出） 或 通过`System.exit(int status)`方法 或 这等价方法退出。
+2. 用户中断进程(例如：Ctrl + C)， 或OS系统事件(用户退出， 系统关机)
+
+shutdownhook 本质上是一个已经初始化，但是未启动的线程。
+
+JVM 在进入shutdown 流程后，多个shutdownhook会并发执行。所有的shutdownhook执行完成后，如果开启了`finalization-on-exit`时，JVM 还会执行所有未被调用的`finalizers`。 
+
+> 注意：如果是通过`System.exit`触发的shutdown流程，则在shutdown流程中，Daemon 和 非Daemon线程还在继续执行。
+>
+> shutdown流程一旦开启，则是不可逆的，除非通过调用`Runtime.halt`方法，该方法会强制关闭JVM。
+>
+> shutdown流程执行中，不能再添加或删除shutdownhook，否则会抛出IllegalStateException异常。
+>
+> shutdownhook 代码需要精心编写：例如是线程安全，不会导致死锁，不会有异常等。
+>
+> JVM 不能响应 kill -9 （SIGKILL）信号
+
+ [JVM对于signal的处理及案例分析](https://www.jianshu.com/p/3cb9aacc26a2) 
+
+### JNA 
+
+在RocketMQ实现中，为了实现高性能，避免进程内存页被swap，它通过调用本地C库API来锁定内存页。这里面就涉及到了Java如何调用本地库的实现。在[JNA]( https://github.com/java-native-access/jna )之前，我们只能通过[JNI]( https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/jniTOC.html )进行跨语言的相互调用，非常的繁琐。幸亏有了JNA，使我们得以非常快捷的实现跨语言调用。
+
+RocketMQ中的实现。
+
+#### 定义本地调用接口
+
+```java
+public interface LibC extends Library {
+    LibC INSTANCE = (LibC) Native.loadLibrary(Platform.isWindows() ? "msvcrt" : "c", LibC.class);
+
+    int MADV_WILLNEED = 3;
+    int MADV_DONTNEED = 4;
+
+    int MCL_CURRENT = 1;
+    int MCL_FUTURE = 2;
+    int MCL_ONFAULT = 4;
+
+    /* sync memory asynchronously */
+    int MS_ASYNC = 0x0001;
+    /* invalidate mappings & caches */
+    int MS_INVALIDATE = 0x0002;
+    /* synchronous memory sync */
+    int MS_SYNC = 0x0004;
+
+    int mlock(Pointer var1, NativeLong var2);
+
+    int munlock(Pointer var1, NativeLong var2);
+
+    int madvise(Pointer var1, NativeLong var2, int var3);
+
+    Pointer memset(Pointer p, int v, long len);
+
+    int mlockall(int flags);
+
+    int msync(Pointer p, NativeLong length, int flags);
+}
+```
+
+> 本地库接口一般继承`Library` ，在接口中定义你需要调用的本地API对应的Java方法。这里需要非常注意Jav、a中的数据类型和本地接口的数据类型匹配问题。此外还需要注意一定订单一个`public static`的变量
+>
+> 该变量就是你调用本地API的入口对象。
+
+
+
+#### 内存锁定
+
+有了和本地API进行交互的能力后，就可以方便的利用Java SDK中不具备，只能通过本地接口提供的功能了。
+
+##### mlock
+
+mlock 方法接受2个参数，一个是要锁定内存的起始地址，一个是锁定的大小。但是需要注意的是你锁定的页面当前页可能并不在物理内存中，因此你需要对要锁定的内存区域写入数据。RocketMQ就是在创建MappedFile并warm的时候写入0进行内存完全占用的。
+
+内存锁定是危险操作，需要具有ROOT权限。
+
+##### munlock
+
+作用同mlock相反，用来取消内存锁定。
+
+## 个人思考
+
+1. OS_PAGE_SIZE 在刷盘时，是按照页大小4K进行的，如果操作系统(应用进程)启用了大页，是不是可以通过大页作为单位呢？
+
+2. 刷盘时，最少页数的计算 ((write / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE)) >= flushLeastPages; 是不是可以通过 (write - flush) / OS_PAGE_SIZE >= flushLeastPages 呢？
+
+3. 同步刷盘需要处理一个刷盘请求队列，队列里面有多个请求，当刷盘请求较密集时(还有线程切换原因)，可能导致多次调用force方法，但是每次刷盘的数据其实不会很多。现有的逻辑是每次等待10ms来达到类似MySQL redo log组提交的效果，其实 10ms 这个值可以通过 磁盘的IOPS 和 配置参数进行调节，这样刷盘效果可能更好。
+
+4. 感觉消息持久化逻辑和InnoDB的redo log 刷盘逻辑很类型。
+
+5. NUMA 架构下的优化
+
+6. MappedFile wrotePosition, commitedPosition, flushedPosition。 
+
+   1. wrotePosition 是写入到MappedByteBuffer的位置
+   2. commitedPosition 是启用了TransientStorePool后，写入到DirectByteBuffer的位置。
+   3. flushedPosition 是最后刷盘的位置
+   4. wrotePosition  >= commitedPosition >= flushedPosition
+
+   
+
 ## 参考资料
 
 <https://www.jianshu.com/p/453c6e7ff81c>
 
  https://www.jianshu.com/p/ccdf6fc710b0 
+
+ https://www.jianshu.com/p/6d0c118c17de 
+
+ http://jm.taobao.org/2017/03/23/20170323/ 
+
+ https://www.cnblogs.com/lanxuezaipiao/p/3635556.html 
+
+ https://github.com/OpenHFT/Java-Thread-Affinity 

@@ -1238,17 +1238,66 @@ get /api/jobs/{jobName}/trigger
 
 因为执行job的机器会监听`jobName/instances/instanceId`节点的数据变化，然后通过quartz API来触发job的执行。前提是job当前没有执行。后续的版本可能改为堆积式执行。
 
+#### 失效/生效
 
+##### 作用
 
-#### GET 修改job信息
+禁用作业执行
 
 ##### API
 
-get /api/jobs/config/commonDutAutoRenewSmsRemindElasticJob
+get /api/jobs/{jobName}/disable
 
 ##### 实现
 
+通过将节点`jobName/servers/`下的每个子节点`ip`的数据修改为disabled来禁止Job的执行。原理是在Job执行时需要分片，分片时会判断分片所在Server 是不是可用状态（即，`jobName/servers/ip`）节点的值不是`disabled`。
 
+我们在操作`servers/ip`节点或`intances/instanceId`节点时，监听器都会设置需要分片的标志，下次任务执行时，就会重新分片，即使原有的分片都OK。
+
+禁用Job， 其实就是让Job没有可用的Server。
+
+```java
+ShardingService
+public void shardingIfNecessary() {
+    List<JobInstance> availableJobInstances = instanceService.getAvailableJobInstances();
+    if (!isNeedSharding() || availableJobInstances.isEmpty()) {
+        return;
+    }
+    // 省略代码   
+} 
+InstanceService
+public List<JobInstance> getAvailableJobInstances() {
+    List<JobInstance> result = new LinkedList<>();
+    for (String each : jobNodeStorage.getJobNodeChildrenKeys(InstanceNode.ROOT)) {
+        JobInstance jobInstance = new JobInstance(each);
+        if (serverService.isEnableServer(jobInstance.getIp())) {
+            result.add(new JobInstance(each));
+        }
+    }
+    return result;
+}
+
+ServerService
+public boolean isEnableServer(final String ip) {
+    return !ServerStatus.DISABLED.name().equals(jobNodeStorage.getJobNodeData(serverNode.getServerNode(ip)));
+}
+```
+
+#### 终止
+
+##### API
+
+PUT /api/jobs/{jobName}/shutdown
+
+##### 实现
+
+删除`jobName/instances`节点下的所有子节点。
+
+如果是从Server维度来操作的话，则只删除指定IP下的所有instance。`jobName/instances/instanceId` instanceId的ip是指定的IP。
+
+监听器会处理instances节点变更时间，导致Job下次执行时重新分片，分片时因为没有可用的分片(jobName/instances 节点下面没有子节点)
+
+终止Job，实质上就是让Job调度时没有可用的实例。
 
 #### PUT 修改job信息
 
@@ -1258,7 +1307,7 @@ PUT /api/jobs/config
 
 ##### 实现
 
-
+直接修改`jobName/config`节点的值
 
 #### 获取Job分片信息
 
