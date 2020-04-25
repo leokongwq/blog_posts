@@ -1,3 +1,13 @@
+---
+layout: post
+comments: true
+title: HttpMessageConverter总结
+date: 2019-09-13 22:31:14
+tags:
+    - Spring
+categories:
+---
+
 ### HttpMessageConverter 是什么？
 
 简单来说`HttpMessageConverter`是spring-web提供的一个接口，用来将HTTP请求转为应用使用的数据，或将HTTP接口的返回数据转为客户端需要的数据。
@@ -38,7 +48,7 @@ public interface HttpMessageConverter<T> {
 }
 ```
 
-
+<!-- more -->
 
 ### FastJsonHttpMessageConverter
 
@@ -288,3 +298,4 @@ if (isJsonp) {
 ### spring-mvc 内容协商
 
 参考：[https://junq.io/spring-mvc%E5%AE%9E%E7%8E%B0http%E5%86%85%E5%AE%B9%E5%8D%8F%E5%95%86-content-negotiation.html](https://junq.io/spring-mvc实现http内容协商-content-negotiation.html)
+

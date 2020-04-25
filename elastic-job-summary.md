@@ -1,3 +1,13 @@
+---
+layout: post
+comments: true
+title: elastic-job学习总结
+date: 2019-11-12 21:22:49
+tags:
+    - 任务调度 
+categories:
+---
+
 ## elastic-job 是什么？
 
 还是看官方文档介绍：<http://elasticjob.io/docs/elastic-job-lite/00-overview/>
@@ -9,6 +19,8 @@
 ![Elastic-Job-Lite Architecture](http://elasticjob.io/docs/elastic-job-lite/img/architecture/elastic_job_lite.png)
 
 从上图可以看到 elastic-job 的实现主要依赖的外部组件是zookeeper。 用zookeeper来实现分布式任务的协调及相关任务信息的保存。具体任务的调度触发还是依赖core模块里面的Quartz API提供的能力。
+
+<!-- more -->
 
 ### spring 集成分析
 
@@ -1352,3 +1364,4 @@ status 值的判断逻辑为：如果`jobName/sharding/0/disabled`节点存在�
 如果`jobName/instances/instanceId` `节点不存在，则为`SHARDING_FLAG`的，表示需要分片。
 
 其它情况表示待调度执行。
+
