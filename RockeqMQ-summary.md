@@ -1605,6 +1605,284 @@ ConsumeQueue中每个消息时20Byte长。结构为
 
 ![img](https://upload-images.jianshu.io/upload_images/5149787-be103f4e0b434fe5.png?imageMogr2/auto-orient/strip|imageView2/2/w/1200/format/webp)
 
+
+
+## 消息消费
+
+有两种消费消费模式，但本质上都是去Broker上pull消息，不同之处在于一个是开发编程去主动拉去消息，更新消息消费offset，一种是框架内部实现拉去消息，然后主动调用消息消费Listener。
+
+### PullMessageService
+
+`PullMessageService`该类(一个后台线程)负责在Consumer启动的时候从Broker上拉取消息。
+
+```java
+@Override
+public void run() {
+  log.info(this.getServiceName() + " service started");
+
+  while (!this.isStopped()) {
+    try {
+      PullRequest pullRequest = this.pullRequestQueue.take();
+      this.pullMessage(pullRequest);
+    } catch (InterruptedException ignored) {
+    } catch (Exception e) {
+      log.error("Pull Message Service Run Method exception", e);
+    }
+  }
+
+  log.info(this.getServiceName() + " service end");
+}
+```
+
+逻辑很简单，就是从一个阻塞队列里不停的获取任务，然后执行。
+
+问题：谁在放任务？
+
+1. RebalanceService.run
+
+```java
+private boolean updateProcessQueueTableInRebalance(final String topic, final Set<MessageQueue> mqSet,
+        final boolean isOrder) {
+
+        List<PullRequest> pullRequestList = new ArrayList<PullRequest>();
+        for (MessageQueue mq : mqSet) {
+          if (nextOffset >= 0) {
+            ProcessQueue pre = this.processQueueTable.putIfAbsent(mq, pq);
+            if (pre != null) {
+              log.info("doRebalance, {}, mq already exists, {}", consumerGroup, mq);
+            } else {
+              log.info("doRebalance, {}, add a new mq, {}", consumerGroup, mq);
+              PullRequest pullRequest = new PullRequest();
+              pullRequest.setConsumerGroup(consumerGroup);
+              pullRequest.setNextOffset(nextOffset);
+              pullRequest.setMessageQueue(mq);
+              pullRequest.setProcessQueue(pq);
+              pullRequestList.add(pullRequest);
+              changed = true;
+            }
+          } else {
+            log.warn("doRebalance, {}, add new mq failed, {}", consumerGroup, mq);
+          }
+         
+        }
+				// 
+        this.dispatchPullRequest(pullRequestList);
+
+        return changed;
+}
+//RebalancePushImpl.java
+@Override
+public void dispatchPullRequest(List<PullRequest> pullRequestList) {
+  for (PullRequest pullRequest : pullRequestList) {
+    this.defaultMQPushConsumerImpl.executePullRequestImmediately(pullRequest);
+    log.info("doRebalance, {}, add a new pull request {}", consumerGroup, pullRequest);
+  }
+}
+```
+
+
+
+1. DefaultMQPushConsumerImpl.pullMessage方法里面定义的PullCallback
+
+也就是说其实就是PullCallback的onSuccess和onException中调用了pullRequestQueue的put逻辑。
+而PullCallback实际就是每次拉取消息之后的回调类。也就是保证了拉完消息之后都会调用pullRequestQueue的put逻辑。
+
+小结：
+
+根据1和2得出结论：
+
+当consumer启动时，RebalanceService使得了pullRequestQueue有值，PullMessageService的线程不停地从pullRequestQueue中take messagequene拉取消息处理，处理完之后继续往pullRequestQueue存放messagequene，从而使得pullRequestQueue不会因为没有值而阻塞。这里也可以基本解释了前面抛出的问题1（pullRequestQueue每次take完因此，都会再继续put messagequene，而拉取消息实际又是一个while不停地循环去拉取消息，这样就保证了消费消息的及时性）。
+
+### ConsumeMessageService
+
+`PullMessageService`拉取的消息交给`ConsumeMessageService`来负责消费，具体的子类有`ConsumeMessageConcurrentlyService`和`ConsumeMessageOrderlyService`。
+
+#### ConsumeMessageConcurrentlyService
+
+```java
+@Override
+public void submitConsumeRequest(
+  final List<MessageExt> msgs,
+  final ProcessQueue processQueue,
+  final MessageQueue messageQueue,
+  final boolean dispatchToConsume) {
+  // 批量消费的批次大小，默认是1，也就是说每个并发消费的线程每次消费一条消息
+  final int consumeBatchSize = this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
+  if (msgs.size() <= consumeBatchSize) {
+    // 很好立即
+    ConsumeRequest consumeRequest = new ConsumeRequest(msgs, processQueue, messageQueue);
+    try {
+      // 提交到线程池异步消费
+      this.consumeExecutor.submit(consumeRequest);
+    } catch (RejectedExecutionException e) {
+      this.submitConsumeRequestLater(consumeRequest);
+    }
+  } else {
+    // 拉取的消息大于批量消费的大小设置，需要对结果的分割。
+    for (int total = 0; total < msgs.size(); ) {
+      List<MessageExt> msgThis = new ArrayList<MessageExt>(consumeBatchSize);
+      for (int i = 0; i < consumeBatchSize; i++, total++) {
+        if (total < msgs.size()) {
+          msgThis.add(msgs.get(total));
+        } else {
+          break;
+        }
+      }
+			// 提交到线程池异步消费
+      ConsumeRequest consumeRequest = new ConsumeRequest(msgThis, processQueue, messageQueue);
+      try {
+        this.consumeExecutor.submit(consumeRequest);
+      } catch (RejectedExecutionException e) {
+        for (; total < msgs.size(); total++) {
+          msgThis.add(msgs.get(total));
+        }
+
+        this.submitConsumeRequestLater(consumeRequest);
+      }
+    }
+  }
+}
+```
+
+#### ConsumeRequest
+
+```java
+ @Override
+public void run() {
+  MessageListenerConcurrently listener = ConsumeMessageConcurrentlyService.this.messageListener;
+  ConsumeConcurrentlyContext context = new ConsumeConcurrentlyContext(messageQueue);
+  ConsumeConcurrentlyStatus status = null;
+
+  ConsumeMessageContext consumeMessageContext = null;
+  
+  long beginTimestamp = System.currentTimeMillis();
+  boolean hasException = false;
+  ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
+  try {
+    ConsumeMessageConcurrentlyService.this.resetRetryTopic(msgs);
+   	// 调用应用提供的消费Listener
+    status = listener.consumeMessage(Collections.unmodifiableList(msgs), context);
+  } catch (Throwable e) {
+    log.warn("consumeMessage exception: {} Group: {} Msgs: {} MQ: {}",
+             RemotingHelper.exceptionSimpleDesc(e),
+             ConsumeMessageConcurrentlyService.this.consumerGroup,
+             msgs,
+             messageQueue);
+    hasException = true;
+  }
+  long consumeRT = System.currentTimeMillis() - beginTimestamp;
+  if (null == status) {
+    if (hasException) {
+      returnType = ConsumeReturnType.EXCEPTION;
+    } else {
+      returnType = ConsumeReturnType.RETURNNULL;
+    }
+  } else if (consumeRT >= defaultMQPushConsumer.getConsumeTimeout() * 60 * 1000) {
+    // 消费超时。默认15min
+    returnType = ConsumeReturnType.TIME_OUT;
+  } else if (ConsumeConcurrentlyStatus.RECONSUME_LATER == status) {
+    returnType = ConsumeReturnType.FAILED;
+  } else if (ConsumeConcurrentlyStatus.CONSUME_SUCCESS == status) {
+    returnType = ConsumeReturnType.SUCCESS;
+  }
+
+  if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+    consumeMessageContext.getProps().put(MixAll.CONSUME_CONTEXT_TYPE, returnType.name());
+  }
+
+  // 返回Null表示，重新消费
+  if (null == status) {
+    log.warn("consumeMessage return null, Group: {} Msgs: {} MQ: {}",
+             ConsumeMessageConcurrentlyService.this.consumerGroup,
+             msgs,
+             messageQueue);
+    status = ConsumeConcurrentlyStatus.RECONSUME_LATER;
+  }
+
+  ConsumeMessageConcurrentlyService.this.getConsumerStatsManager()
+    .incConsumeRT(ConsumeMessageConcurrentlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
+
+  if (!processQueue.isDropped()) {
+    ConsumeMessageConcurrentlyService.this.processConsumeResult(status, context, this);
+  } else {
+    log.warn("processQueue is dropped without process consume result. messageQueue={}, msgs={}", messageQueue, msgs);
+  }
+}
+// 处理消费结果状态
+public void processConsumeResult(
+        final ConsumeConcurrentlyStatus status,
+        final ConsumeConcurrentlyContext context,
+        final ConsumeRequest consumeRequest
+    ) {
+        int ackIndex = context.getAckIndex();
+
+        if (consumeRequest.getMsgs().isEmpty())
+            return;
+
+        switch (status) {
+            case CONSUME_SUCCESS:
+                if (ackIndex >= consumeRequest.getMsgs().size()) {
+                    ackIndex = consumeRequest.getMsgs().size() - 1;
+                }
+                // 成功消费，推进ackIndex
+                int ok = ackIndex + 1;
+                int failed = consumeRequest.getMsgs().size() - ok;
+                this.getConsumerStatsManager().incConsumeOKTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(), ok);
+                this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(), failed);
+                break;
+            case RECONSUME_LATER:
+                // 设置为特殊值，后面会特殊处理。
+                ackIndex = -1;
+                this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(),
+                    consumeRequest.getMsgs().size());
+                break;
+            default:
+                break;
+        }
+
+        switch (this.defaultMQPushConsumer.getMessageModel()) {
+            case BROADCASTING:
+                for (int i = ackIndex + 1; i < consumeRequest.getMsgs().size(); i++) {
+                    MessageExt msg = consumeRequest.getMsgs().get(i);
+                    log.warn("BROADCASTING, the message consume failed, drop it, {}", msg.toString());
+                }
+                break;
+            case CLUSTERING:
+                List<MessageExt> msgBackFailed = new ArrayList<MessageExt>(consumeRequest.getMsgs().size());
+                // 如果消费失败，相当于从0开始，将本线程负责消费的消息发送回Broker
+                for (int i = ackIndex + 1; i < consumeRequest.getMsgs().size(); i++) {
+                    MessageExt msg = consumeRequest.getMsgs().get(i);
+                    // 一条条的发送，是不是有性能问题。
+                    boolean result = this.sendMessageBack(msg, context);
+                    if (!result) {
+                        msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
+                        msgBackFailed.add(msg);
+                    }
+                }
+
+                if (!msgBackFailed.isEmpty()) {
+                    consumeRequest.getMsgs().removeAll(msgBackFailed);
+										// 回送失败的消息，重新发送。每5秒重试一次。
+                    this.submitConsumeRequestLater(msgBackFailed, consumeRequest.getProcessQueue(), consumeRequest.getMessageQueue());
+                }
+                break;
+            default:
+                break;
+        }
+
+        long offset = consumeRequest.getProcessQueue().removeMessage(consumeRequest.getMsgs());
+        if (offset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
+            this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(consumeRequest.getMessageQueue(), offset, true);
+        }
+}
+```
+
+
+
+
+
+
+
 ## 相关知识总结
 
 ### JVM shutdownhook
