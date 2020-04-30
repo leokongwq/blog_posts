@@ -1979,7 +1979,7 @@ End_log_pos: 120
 查看远程服务器上的binlog
 
 ```sql
-mysqlbinlog -ubosstest -p -P6183 -hbj.bosstest.w.qiyi.db --start-datetime='2019-01-15 16:38:00' --stop-datetime='2019-01-15 16:40:00' --read-from-remote-server -vv mysql-bin.000607 > row.sql
+mysqlbinlog -ubosstest -p -P6183 -h127.0.0.1 --start-datetime='2019-01-15 16:38:00' --stop-datetime='2019-01-15 16:40:00' --read-from-remote-server -vv mysql-bin.000607 > row.sql
 ```
 
 内容：

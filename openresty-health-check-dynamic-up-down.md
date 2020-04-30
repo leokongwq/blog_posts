@@ -237,7 +237,7 @@ import scala.concurrent.duration._
 class AccessLimit extends Simulation {
 
 	val httpConf = http
-		.baseURL("http://i.vip.iqiyi.com/")
+		.baseURL("http://www.google.com/")
 		.acceptHeader("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		.doNotTrackHeader("1")
 		.acceptLanguageHeader("zh-CN,en;q=0.5")
